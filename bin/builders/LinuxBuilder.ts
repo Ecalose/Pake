@@ -23,7 +23,7 @@ export default class LinuxBuilder extends BaseBuilder {
   }
 
   getFileName() {
-    const { name, targets } = this.options;
+    const { name = 'pake-app', targets } = this.options;
     const version = tauriConfig.version;
 
     let arch: string;
@@ -52,8 +52,12 @@ export default class LinuxBuilder extends BaseBuilder {
 
   async build(url: string) {
     const targetTypes = ['deb', 'appimage', 'rpm'];
+    const requestedTargets = this.options.targets
+      .split(',')
+      .map((t: string) => t.trim());
+
     for (const target of targetTypes) {
-      if (this.options.targets === target) {
+      if (requestedTargets.includes(target)) {
         await this.buildAndCopy(url, target);
       }
     }
@@ -64,7 +68,7 @@ export default class LinuxBuilder extends BaseBuilder {
 
     const buildTarget =
       this.buildArch === 'arm64'
-        ? this.getTauriTarget(this.buildArch, 'linux')
+        ? (this.getTauriTarget(this.buildArch, 'linux') ?? undefined)
         : undefined;
 
     let fullCommand = this.buildBaseCommand(

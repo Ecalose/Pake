@@ -2,7 +2,11 @@ name: Build Single Popular App
 
 env:
   NODE_VERSION: "22"
-  PNPM_VERSION: "10.15.0"
+  PNPM_VERSION: "10.26.2"
+
+concurrency:
+  group: build-app-${{ github.workflow }}-${{ github.ref }}-${{ inputs.name }}
+  cancel-in-progress: true
 
 on:
   workflow_dispatch:
@@ -23,6 +27,9 @@ on:
         description: "App URL"
         required: true
         default: "https://twitter.com/"
+      icon:
+        description: "App Icon"
+        required: false
   workflow_call:
     inputs:
       name:
@@ -45,10 +52,37 @@ on:
         required: true
         type: string
         default: "https://twitter.com/"
+      icon:
+        description: "App Icon"
+        type: string
+        required: false
 
 jobs:
+  build-cli:
+    name: Build CLI
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js Environment
+        uses: ./.github/actions/setup-env
+        with:
+          mode: 'node'
+
+      - name: Build CLI
+        run: pnpm run cli:build
+
+      - name: Upload CLI Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pake-cli-dist
+          path: dist/
+          retention-days: 1
+
   build:
     name: ${{ inputs.title }} (${{ matrix.build }})
+    needs: build-cli
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -76,77 +110,146 @@ jobs:
       - name: Setup Node.js Environment
         uses: ./.github/actions/setup-env
         with:
-          mode: ${{ (matrix.build == 'linux' || matrix.build == 'macos') && 'build' || 'node' }}
+          mode: build
 
-      - name: Rust cache restore
-        uses: actions/cache/restore@v4.2.0
-        id: cache_store
+      - name: Download CLI Artifact
+        uses: actions/download-artifact@v4
         with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            src-tauri/target/
-          key: ${{ runner.os }}-cargo-${{ inputs.name }}-${{ hashFiles('**/Cargo.lock') }}
+          name: pake-cli-dist
+          path: dist
 
-      - name: Config App
-        env:
-          NAME: ${{ inputs.name }}
-          TITLE: ${{ inputs.title }}
-          NAME_ZH: ${{ inputs.name_zh }}
-          URL: ${{ inputs.url }}
-        run: pnpm run build:config
+      - name: Setup mold linker
+        if: matrix.os == 'ubuntu-latest'
+        uses: rui314/setup-mold@v1
 
       - name: Build for Linux
         if: matrix.os == 'ubuntu-latest'
-        timeout-minutes: 15
+        timeout-minutes: 20
         run: |
-          pnpm run tauri build
+          ARGS="${{ inputs.url }} --name ${{ inputs.name }}"
+          if [ -n "${{ inputs.icon }}" ]; then ARGS="$ARGS --icon ${{ inputs.icon }}"; fi
+
+          # Build once with multiple targets (faster than separate builds)
+          node dist/cli.js $ARGS --targets deb,appimage
+
           mkdir -p output/linux
-          mv src-tauri/target/release/bundle/deb/*.deb output/linux/${{inputs.title}}_`arch`.deb
-          mv src-tauri/target/release/bundle/appimage/*.AppImage output/linux/"${{inputs.title}}"_`arch`.AppImage
+
+          # The CLI copies files to project root and removes them from bundle directory
+          # Check project root first, then fallback to bundle directory
+          if [ -f "${{ inputs.name }}.deb" ]; then
+            mv "${{ inputs.name }}.deb" output/linux/${{inputs.title}}_`arch`.deb
+          elif [ -n "$(ls src-tauri/target/release/bundle/deb/*.deb 2>/dev/null)" ]; then
+            mv src-tauri/target/release/bundle/deb/*.deb output/linux/${{inputs.title}}_`arch`.deb
+          else
+            echo "Error: No DEB file found"
+            find . -name "*.deb" -type f
+            exit 1
+          fi
+
+          if [ -f "${{ inputs.name }}.AppImage" ]; then
+            mv "${{ inputs.name }}.AppImage" output/linux/"${{inputs.title}}"_`arch`.AppImage
+          elif [ -n "$(ls src-tauri/target/release/bundle/appimage/*.AppImage 2>/dev/null)" ]; then
+            mv src-tauri/target/release/bundle/appimage/*.AppImage output/linux/"${{inputs.title}}"_`arch`.AppImage
+          else
+            echo "Error: No AppImage file found"
+            find . -name "*.AppImage" -type f
+            exit 1
+          fi
+
+          if [ -f "src-tauri/png/${{ inputs.name }}_512.png" ]; then
+            cp "src-tauri/png/${{ inputs.name }}_512.png" output/linux/
+          fi
 
       - name: Build for macOS
         if: matrix.os == 'macos-latest'
-        timeout-minutes: 20
+        timeout-minutes: 25
         run: |
-          pnpm run build:mac
+          ARGS="${{ inputs.url }} --name ${{ inputs.name }}"
+          if [ -n "${{ inputs.icon }}" ]; then ARGS="$ARGS --icon ${{ inputs.icon }}"; fi
+
+          node dist/cli.js $ARGS --targets universal --multi-arch
+
           mkdir -p output/macos
-          mv src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg output/macos/"${{inputs.title}}".dmg
+
+          # The CLI copies the DMG to project root and removes it from bundle directory
+          # Check project root first, then fallback to bundle directory
+          if [ -f "${{ inputs.name }}.dmg" ]; then
+            mv "${{ inputs.name }}.dmg" output/macos/"${{inputs.title}}".dmg
+          elif [ -n "$(ls src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg 2>/dev/null)" ]; then
+            mv src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg output/macos/"${{inputs.title}}".dmg
+          else
+            echo "Error: No DMG file found"
+            echo "Searched locations:"
+            echo "  - ${{ inputs.name }}.dmg (project root)"
+            echo "  - src-tauri/target/universal-apple-darwin/release/bundle/dmg/"
+            find . -name "*.dmg" -type f
+            exit 1
+          fi
+
+          if [ -f "src-tauri/png/${{ inputs.name }}_512.png" ]; then
+            cp "src-tauri/png/${{ inputs.name }}_512.png" output/macos/
+          elif [ -f "src-tauri/icons/${{ inputs.name }}.icns" ]; then
+             cp "src-tauri/icons/${{ inputs.name }}.icns" output/macos/
+          fi
 
       - name: Build for Windows
         if: matrix.os == 'windows-latest'
-        timeout-minutes: 15
+        timeout-minutes: 20
         run: |
-          pnpm run build
-          New-Item -Path "output\windows" -ItemType Directory -Force
-          $msiFiles = Get-ChildItem -Path "src-tauri\target\release\bundle\msi\*.msi" -ErrorAction SilentlyContinue
-          if ($msiFiles) {
-            Move-Item -Path $msiFiles[0].FullName -Destination "output\windows\${{inputs.title}}_x64.msi"
-          } else {
-            Write-Error "No MSI files found at: src-tauri\target\release\bundle\msi\"
-            Get-ChildItem -Path "src-tauri\target\" -Recurse -Name "*.msi" | Write-Host
-            exit 1
-          }
-          git checkout -- src-tauri/Cargo.lock
+          $args = "${{ inputs.url }}", "--name", "${{ inputs.name }}"
+          if ("${{ inputs.icon }}" -ne "") { $args += "--icon", "${{ inputs.icon }}" }
+          $args += "--targets", "x64"
 
-      - name: Rust cache store
-        uses: actions/cache/save@v4.2.0
-        if: steps.cache_store.outputs.cache-hit != 'true'
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            src-tauri/target/
-          key: ${{ runner.os }}-cargo-${{ inputs.name }}-${{ hashFiles('**/Cargo.lock') }}
+          node dist/cli.js $args
+
+          New-Item -Path "output\windows" -ItemType Directory -Force
+
+          # The CLI copies the MSI to project root and removes it from bundle directory
+          # Check project root first, then fallback to bundle directories
+          $projectRootMsi = "${{ inputs.name }}.msi"
+
+          if (Test-Path $projectRootMsi) {
+            Move-Item -Path $projectRootMsi -Destination "output\windows\${{inputs.title}}_x64.msi"
+          } else {
+            # Check architecture-specific path (x64 builds)
+            $msiFiles = Get-ChildItem -Path "src-tauri\target\x86_64-pc-windows-msvc\release\bundle\msi\*.msi" -ErrorAction SilentlyContinue
+
+            # Fallback to generic path
+            if (-not $msiFiles) {
+              $msiFiles = Get-ChildItem -Path "src-tauri\target\release\bundle\msi\*.msi" -ErrorAction SilentlyContinue
+            }
+
+            if ($msiFiles) {
+              Move-Item -Path $msiFiles[0].FullName -Destination "output\windows\${{inputs.title}}_x64.msi"
+            } else {
+              Write-Error "No MSI files found in expected locations"
+              Write-Host "Searched paths:"
+              Write-Host "  - $projectRootMsi (project root)"
+              Write-Host "  - src-tauri\target\x86_64-pc-windows-msvc\release\bundle\msi\"
+              Write-Host "  - src-tauri\target\release\bundle\msi\"
+              Write-Host "`nAll MSI files in target directory:"
+              Get-ChildItem -Path "src-tauri\target\" -Recurse -Name "*.msi" | Write-Host
+              exit 1
+            }
+          }
+
+
+
+          $pngPath = "src-tauri\png\${{ inputs.name }}_512.png"
+          $icoPath = "src-tauri\png\${{ inputs.name }}_256.ico"
+
+          if (Test-Path $pngPath) {
+            Copy-Item -Path $pngPath -Destination "output\windows\"
+          } elseif (Test-Path $icoPath) {
+            Copy-Item -Path $icoPath -Destination "output\windows\"
+          }
+
+          git checkout -- src-tauri/Cargo.lock
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ inputs.title }}-${{ matrix.build }}
+          name: ${{ inputs.title }}-${{ matrix.build }}-${{ github.run_attempt }}
           path: output/*/*.*
           retention-days: 3
 
